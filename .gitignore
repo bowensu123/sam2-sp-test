@@ -7,5 +7,6 @@ __pycache__/
 build/*
 _C.*
 outputs/*
+sam2_logs/
 checkpoints/*.pt
 demo/backend/checkpoints/*.pt
