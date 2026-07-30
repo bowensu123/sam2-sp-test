@@ -11,6 +11,7 @@ import torch
 import torch.distributed
 from sam2.modeling.sam2_base import SAM2Base
 from sam2.modeling.sam2_utils import (
+    checkpoint_module,
     get_1d_sine_pe,
     get_next_point,
     sample_box_points,
@@ -70,12 +71,24 @@ class SAM2Train(SAM2Base):
         # training (lowering the transient peak memory; the results are identical to
         # forwarding all frames at once since the backbone treats frames independently)
         backbone_img_chunk_size=-1,
+        # optional detail-capture module (see sam2.modeling.detail_capture). Its outputs
+        # are added as residuals to the stride-4 and stride-8 high-res features consumed
+        # by the SAM mask decoder. It is computed lazily per frame in the tracking loop
+        # under activation checkpointing, so its full-resolution intermediate activations
+        # never persist until backward.
+        detail_capture=None,
         **kwargs,
     ):
         super().__init__(image_encoder, memory_attention, memory_encoder, **kwargs)
         self.use_act_ckpt_iterative_pt_sampling = use_act_ckpt_iterative_pt_sampling
         self.forward_backbone_per_frame_for_eval = forward_backbone_per_frame_for_eval
         self.backbone_img_chunk_size = backbone_img_chunk_size
+        self.detail_capture = detail_capture
+        if detail_capture is not None:
+            assert self.use_high_res_features_in_sam, (
+                "detail_capture requires use_high_res_features_in_sam=True since its "
+                "outputs are fused into the high-res SAM decoder features"
+            )
 
         # Point sampler and conditioning frames
         self.prob_to_use_pt_input_for_train = prob_to_use_pt_input_for_train
@@ -134,6 +147,26 @@ class SAM2Train(SAM2Base):
             ],
         }
 
+    def _add_detail_features(self, img_batch, img_ids, current_vision_feats):
+        """Fuse detail-capture outputs into the high-res SAM features (levels 0 and 1).
+
+        The detail stream is run lazily on the (unique) frames of the current
+        tracking step and under activation checkpointing, so its full-resolution
+        intermediate activations are recomputed in backward instead of stored.
+        """
+        if img_ids.numel() > 1:
+            unique_img_ids, inv_ids = torch.unique(img_ids, return_inverse=True)
+        else:
+            unique_img_ids, inv_ids = img_ids, None
+        detail_feats = checkpoint_module(self.detail_capture, img_batch[unique_img_ids])
+        fused = list(current_vision_feats)
+        for lvl, d in enumerate(detail_feats):
+            if inv_ids is not None:
+                d = d[inv_ids]
+            # (B, C, H, W) -> (HW, B, C) to match the vision_feats layout
+            fused[lvl] = fused[lvl] + d.flatten(2).permute(2, 0, 1)
+        return fused
+
     def forward(self, input: BatchedVideoDatapoint):
         if self.training or not self.forward_backbone_per_frame_for_eval:
             # precompute image features on all frames before tracking
@@ -170,6 +203,9 @@ class SAM2Train(SAM2Base):
             image = image[inv_ids]
             vision_feats = [x[:, inv_ids] for x in vision_feats]
             vision_pos_embeds = [x[:, inv_ids] for x in vision_pos_embeds]
+
+        if self.detail_capture is not None:
+            vision_feats = self._add_detail_features(img_batch, img_ids, vision_feats)
 
         return image, vision_feats, vision_pos_embeds, feat_sizes
 
@@ -330,6 +366,10 @@ class SAM2Train(SAM2Base):
                 # Retrieve image features according to img_ids (if they are already computed).
                 current_vision_feats = [x[:, img_ids] for x in vision_feats]
                 current_vision_pos_embeds = [x[:, img_ids] for x in vision_pos_embeds]
+                if self.detail_capture is not None:
+                    current_vision_feats = self._add_detail_features(
+                        input.flat_img_batch, img_ids, current_vision_feats
+                    )
             else:
                 # Otherwise, compute the image features on the fly for the given img_ids
                 # (this might be used for evaluation on long videos to avoid backbone OOM).

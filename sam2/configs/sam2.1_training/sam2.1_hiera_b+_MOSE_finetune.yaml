@@ -143,6 +143,16 @@ trainer:
             use_dwconv: True  # depth-wise convs
           num_layers: 2
 
+    # detail-capture stream: fused as zero-init residuals into the stride-4/8
+    # high-res SAM features; computed per frame under activation checkpointing.
+    # Set to null to disable.
+    detail_capture:
+      _target_: sam2.modeling.detail_capture.DetailCapture
+      in_chans: 3
+      mid_chans: [24, 48, 96]
+      out_chans: [32, 64]  # must match mask decoder dims: transformer_dim//8, //4
+      norm: GN  # GN keeps per-frame computation identical to batched; avoid BN here
+
     num_maskmem: 7
     image_size: ${scratch.resolution}
     # forward the backbone at most N frames at a time (identical results, lower peak memory);
