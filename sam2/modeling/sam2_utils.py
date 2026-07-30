@@ -12,8 +12,27 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from sam2.utils.misc import mask_to_box
+
+
+def checkpoint_module(module: nn.Module, *args):
+    """Run `module(*args)` under activation checkpointing during training.
+
+    In training (with grad enabled), only the inputs and outputs of `module` are
+    kept alive; all intermediate activations are recomputed during backward. The
+    recomputation reuses the saved RNG state, so results (loss and gradients)
+    are bit-identical to a plain `module(*args)` call. In eval or no-grad mode,
+    this is a plain call with zero overhead.
+
+    Use at the call site (instead of wrapping the module) so parameter names and
+    checkpoints stay unchanged, e.g.:
+        feats = checkpoint_module(self.detail_capture, images, backbone_feat)
+    """
+    if module.training and torch.is_grad_enabled():
+        return torch.utils.checkpoint.checkpoint(module, *args, use_reentrant=False)
+    return module(*args)
 
 
 def select_closest_cond_frames(frame_idx, cond_frame_outputs, max_cond_frame_num):
