@@ -11,6 +11,7 @@ from typing import List, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from iopath.common.file_io import g_pathmgr
 
 from sam2.modeling.backbones.utils import (
@@ -197,11 +198,13 @@ class Hiera(nn.Module):
         ),
         weights_path=None,
         return_interm_layers=True,  # return feats from every stage
+        use_act_checkpoint=False,  # checkpoint each block during training to save memory
     ):
         super().__init__()
 
         assert len(stages) == len(window_spec)
         self.window_spec = window_spec
+        self.use_act_checkpoint = use_act_checkpoint
 
         depth = sum(stages)
         self.q_stride = q_stride
@@ -289,7 +292,10 @@ class Hiera(nn.Module):
 
         outputs = []
         for i, blk in enumerate(self.blocks):
-            x = blk(x)
+            if self.use_act_checkpoint and self.training and torch.is_grad_enabled():
+                x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
+            else:
+                x = blk(x)
             if (i == self.stage_ends[-1]) or (
                 i in self.stage_ends and self.return_interm_layers
             ):

@@ -71,6 +71,7 @@ trainer:
         embed_dim: 112
         num_heads: 2
         drop_path_rate: 0.1
+        use_act_checkpoint: true  # recompute each block in backward; math-identical, ~5x less activation memory
       neck:
         _target_: sam2.modeling.backbones.image_encoder.FpnNeck
         position_encoding:
