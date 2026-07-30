@@ -66,11 +66,16 @@ class SAM2Train(SAM2Base):
         # of all frames at once. This avoids backbone OOM errors on very long videos in evaluation, but could be slightly slower.
         forward_backbone_per_frame_for_eval=False,
         freeze_image_encoder=False,
+        # if > 0, forward the image backbone on at most this many frames at a time during
+        # training (lowering the transient peak memory; the results are identical to
+        # forwarding all frames at once since the backbone treats frames independently)
+        backbone_img_chunk_size=-1,
         **kwargs,
     ):
         super().__init__(image_encoder, memory_attention, memory_encoder, **kwargs)
         self.use_act_ckpt_iterative_pt_sampling = use_act_ckpt_iterative_pt_sampling
         self.forward_backbone_per_frame_for_eval = forward_backbone_per_frame_for_eval
+        self.backbone_img_chunk_size = backbone_img_chunk_size
 
         # Point sampler and conditioning frames
         self.prob_to_use_pt_input_for_train = prob_to_use_pt_input_for_train
@@ -104,10 +109,35 @@ class SAM2Train(SAM2Base):
             for p in self.image_encoder.parameters():
                 p.requires_grad = False
 
+    def _forward_image_chunked(self, img_batch):
+        """Forward the image backbone in chunks of frames to lower peak memory.
+
+        The image encoder processes each frame independently, so chunking along the
+        batch (frame) dimension and concatenating the outputs is mathematically
+        identical to a single full-batch forward.
+        """
+        chunk_size = self.backbone_img_chunk_size
+        if chunk_size <= 0 or img_batch.shape[0] <= chunk_size:
+            return self.forward_image(img_batch)
+        chunk_outs = [self.forward_image(c) for c in img_batch.split(chunk_size)]
+        return {
+            "vision_features": torch.cat(
+                [o["vision_features"] for o in chunk_outs], dim=0
+            ),
+            "vision_pos_enc": [
+                torch.cat([o["vision_pos_enc"][i] for o in chunk_outs], dim=0)
+                for i in range(len(chunk_outs[0]["vision_pos_enc"]))
+            ],
+            "backbone_fpn": [
+                torch.cat([o["backbone_fpn"][i] for o in chunk_outs], dim=0)
+                for i in range(len(chunk_outs[0]["backbone_fpn"]))
+            ],
+        }
+
     def forward(self, input: BatchedVideoDatapoint):
         if self.training or not self.forward_backbone_per_frame_for_eval:
             # precompute image features on all frames before tracking
-            backbone_out = self.forward_image(input.flat_img_batch)
+            backbone_out = self._forward_image_chunked(input.flat_img_batch)
         else:
             # defer image feature computation on a frame until it's being tracked
             backbone_out = {"backbone_fpn": None, "vision_pos_enc": None}

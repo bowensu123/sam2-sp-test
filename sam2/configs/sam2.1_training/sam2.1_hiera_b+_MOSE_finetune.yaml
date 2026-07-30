@@ -145,6 +145,9 @@ trainer:
 
     num_maskmem: 7
     image_size: ${scratch.resolution}
+    # forward the backbone at most N frames at a time (identical results, lower peak memory);
+    # set to -1 to forward all frames at once
+    backbone_img_chunk_size: 4
     # apply scaled sigmoid on mask logits for memory encoder, and directly feed input mask as output mask
     sigmoid_scale_for_mem_enc: 20.0
     sigmoid_bias_for_mem_enc: -10.0
