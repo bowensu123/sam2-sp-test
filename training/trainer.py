@@ -94,6 +94,10 @@ class DistributedConf:
     comms_dtype: Optional[str] = None
     find_unused_parameters: bool = False
     timeout_mins: int = 30
+    # Sequence (temporal) parallelism: split the image-encoder forward across
+    # `sequence_parallel_size` GPUs to reduce per-GPU activation memory without
+    # lowering resolution / num_frames / batch_size. Set to 1 (default) to disable.
+    sequence_parallel_size: int = 1
 
 
 @dataclass

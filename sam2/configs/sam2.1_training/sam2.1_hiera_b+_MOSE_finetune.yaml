@@ -295,6 +295,10 @@ trainer:
   distributed:
     backend: nccl
     find_unused_parameters: True
+    # Sequence (temporal) parallelism: split the image-encoder forward across
+    # `sequence_parallel_size` GPUs to reduce per-GPU activation memory without
+    # lowering resolution / num_frames / batch_size. Set to 1 (default) to disable.
+    sequence_parallel_size: 1
 
   logging:
     tensorboard_writer:
