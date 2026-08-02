@@ -19,6 +19,7 @@ from sam2.modeling.sam2_utils import (
 
 from sam2.utils.misc import concat_points
 
+from training.utils import sequence_parallel as sp
 from training.utils.data_utils import BatchedVideoDatapoint
 
 
@@ -103,6 +104,63 @@ class SAM2Train(SAM2Base):
         if freeze_image_encoder:
             for p in self.image_encoder.parameters():
                 p.requires_grad = False
+
+        # Sequence-parallel memory attention: replace the forward of the
+        # existing module (so state_dict keys / param names are unchanged) with
+        # the SP-aware version that shards the spatial (HW) dimension.
+        if sp.is_sp_enabled():
+            from training.model.sp_memory_attention import SPMemoryAttention
+
+            self._sp_mem_attn_wrapper = SPMemoryAttention(self.memory_attention)
+            self.memory_attention.forward = self._sp_mem_attn_wrapper.forward
+            logging.info(
+                "[SP] Wrapped memory_attention.forward with the SP version "
+                f"(sp_size={sp.get_sp_size()})."
+            )
+
+    def forward_image(self, img_batch: torch.Tensor):
+        """Image encoder forward, with optional sequence-parallel sharding.
+
+        When SP is enabled, the (T*B) dimension of `img_batch` is split across
+        the SP group: each rank runs the (heavy) image encoder only on its
+        local chunk, then features are autograd-aware all-gathered so every
+        rank ends up with the full feature set for the downstream memory
+        attention / SAM heads. This is the main memory win of SP: the heaviest
+        activations are sharded across `sp_size` GPUs.
+        """
+        if not sp.is_sp_enabled():
+            return super().forward_image(img_batch)
+
+        sp_size = sp.get_sp_size()
+        sp_rank = sp.get_sp_rank()
+        n_imgs = img_batch.shape[0]
+        assert (
+            n_imgs % sp_size == 0
+        ), (
+            f"[SP] image batch dim 0 ({n_imgs}) must be divisible by "
+            f"sp_size ({sp_size}); adjust num_frames / train_batch_size "
+            f"or sp_size."
+        )
+        chunk = n_imgs // sp_size
+        local_img = img_batch[sp_rank * chunk : (sp_rank + 1) * chunk]
+        local_out = super().forward_image(local_img)
+
+        # All-gather each output tensor along the (T*B) dim so the rest of the
+        # model sees the full features. `sp_all_gather_cat` is autograd-aware:
+        # the backward routes gradients back to each rank's local chunk only.
+        gathered_out = {
+            "vision_features": sp.sp_all_gather_cat(
+                local_out["vision_features"], dim=0
+            ),
+            "backbone_fpn": [
+                sp.sp_all_gather_cat(t, dim=0) for t in local_out["backbone_fpn"]
+            ],
+            "vision_pos_enc": [
+                sp.sp_all_gather_cat(t, dim=0)
+                for t in local_out["vision_pos_enc"]
+            ],
+        }
+        return gathered_out
 
     def forward(self, input: BatchedVideoDatapoint):
         if self.training or not self.forward_backbone_per_frame_for_eval:
