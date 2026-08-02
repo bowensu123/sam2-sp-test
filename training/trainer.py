@@ -33,6 +33,7 @@ from training.utils.checkpoint_utils import (
 from training.utils.data_utils import BatchedVideoDatapoint
 from training.utils.distributed import all_reduce_max, barrier, get_rank
 
+from training.utils import sequence_parallel as sp
 from training.utils.logger import Logger, setup_logging
 
 from training.utils.train_utils import (
@@ -189,6 +190,11 @@ class Trainer:
 
         self._setup_torch_dist_and_backend(cuda, distributed)
 
+        # Initialize sequence-parallel groups (must happen after
+        # `dist.init_process_group` and before dataloader / DDP setup so the
+        # DistributedSampler and DDP can use the DP group).
+        sp.init_sequence_parallel(distributed.sequence_parallel_size)
+
         makedir(self.logging_conf.log_dir)
         setup_logging(
             __name__,
@@ -292,10 +298,15 @@ class Trainer:
 
         assert isinstance(self.model, torch.nn.Module)
 
+        # When SP is on, DDP averages gradients across the DP group only;
+        # image-encoder grads are partial on each SP rank and get summed
+        # across the SP group in `sync_image_encoder_grads_for_sp`.
+        ddp_process_group = sp.get_dp_group() if sp.is_sp_enabled() else None
         self.model = nn.parallel.DistributedDataParallel(
             self.model,
             device_ids=[self.local_rank] if accelerator == "cuda" else [],
             find_unused_parameters=distributed_conf.find_unused_parameters,
+            process_group=ddp_process_group,
         )
         if distributed_conf.comms_dtype is not None:  # noqa
             from torch.distributed.algorithms import ddp_comm_hooks
@@ -307,8 +318,9 @@ class Trainer:
             else:
                 hook = ddp_comm_hooks.default_hooks.fp16_compress_hook
                 logging.info("Enabling fp16 grad communication")
-            process_group = None
-            self.model.register_comm_hook(process_group, hook)
+            # The comm hook operates over the same group DDP uses (DP group
+            # when SP is on, default group otherwise).
+            self.model.register_comm_hook(ddp_process_group, hook)
 
     def _move_to_device(self):
         logging.info(
@@ -782,10 +794,26 @@ class Trainer:
                 # the SP group recovers the correct gradient. Must run AFTER
                 # `unscale_` (so scaled grads don't overflow during SUM) and
                 # BEFORE clipping (so the clipper sees final grads).
-                # Clipping gradients and detecting diverging gradients
-                if self.gradient_clipper is not None:
+                if sp.is_sp_enabled() or self.gradient_clipper is not None:
                     self.scaler.unscale_(self.optim.optimizer)
-                    self.gradient_clipper(model=self.model)
+                    if sp.is_sp_enabled():
+                        # SP-sharded modules get partial grads on each SP
+                        # rank; SUM across the SP group recovers the full
+                        # gradient. This covers:
+                        # - image_encoder (Hiera, sharded on T*B)
+                        # - memory_attention (sharded on HW)
+                        # - sam_mask_decoder.conv_s0/conv_s1 (applied inside
+                        #   forward_image, sharded on T*B, but their params
+                        #   live under sam_mask_decoder, not image_encoder)
+                        sp.sync_sp_module_grads(
+                            self.model,
+                            "image_encoder",
+                            "memory_attention",
+                            "sam_mask_decoder.conv_s0",
+                            "sam_mask_decoder.conv_s1",
+                        )
+                    if self.gradient_clipper is not None:
+                        self.gradient_clipper(model=self.model)
 
                 if self.gradient_logger is not None:
                     self.gradient_logger(
