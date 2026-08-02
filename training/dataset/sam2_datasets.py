@@ -14,6 +14,8 @@ from torch.utils.data import BatchSampler, DataLoader, Dataset, IterableDataset,
 
 from torch.utils.data.distributed import DistributedSampler
 
+from training.utils import sequence_parallel as sp
+
 
 class MixedDataLoader:
     def __init__(self, dataloaders: List[DataLoader], mixing_prob: torch.FloatTensor):
@@ -163,7 +165,16 @@ class TorchTrainMixedDataset:
             else:
                 self._set_dataset_epoch(dataset, epoch)
 
-            sampler = DistributedSampler(dataset, shuffle=self.shuffle)
+            sampler = (
+                DistributedSampler(
+                    dataset,
+                    num_replicas=sp.get_dp_size(),
+                    rank=sp.get_dp_rank(),
+                    shuffle=self.shuffle,
+                )
+                if sp.is_sp_enabled()
+                else DistributedSampler(dataset, shuffle=self.shuffle)
+            )
             sampler.set_epoch(epoch)
 
             batch_sampler = BatchSampler(sampler, batch_size, drop_last=self.drop_last)
